@@ -217,8 +217,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))?;
                 std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
             }
+            // GitHub over port 443 (ssh.github.com, same host keys): outbound
+            // port 22 from the cluster intermittently times out. Fail fast
+            // rather than hang, so a retry can take over.
             Some(format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes -o BatchMode=yes",
+                "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes -o BatchMode=yes \
+                 -o HostName=ssh.github.com -o Port=443 -o HostKeyAlias=github.com -o ConnectTimeout=15 \
+                 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
                 copy.display(),
                 known_hosts.display()
             ))

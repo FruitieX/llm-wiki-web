@@ -188,10 +188,13 @@ impl Repo {
 
     async fn fetch(&self) -> Result<(), GitError> {
         let refspec = format!("+refs/heads/{0}:refs/remotes/origin/{0}", self.branch);
-        self.git
-            .run(&["fetch", "--quiet", "origin", &refspec])
-            .await
-            .map(|_| ())
+        let args = ["fetch", "--quiet", "origin", refspec.as_str()];
+        // One quick retry absorbs a dropped connection.
+        if let Err(error) = self.git.run(&args).await {
+            tracing::info!("{error}; retrying once");
+            self.git.run(&args).await?;
+        }
+        Ok(())
     }
 
     fn mark_synced(&self, error: Option<String>) {

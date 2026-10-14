@@ -9,7 +9,7 @@ editor. It has no database: **storage is git**.
 ## How it works
 
 - **Clone.** On start the app clones `LLM_WIKI_REPO_URL` (branch `LLM_WIKI_BRANCH`) into `$LLM_WIKI_DATA_DIR/repo`,
-  using the deploy key in `LLM_WIKI_SSH_KEY_FILE`. GitHub's host keys are pinned in `backend/src/git.rs`.
+  using the deploy key in `LLM_WIKI_SSH_KEY_FILE`, over `ssh.github.com:443` (port 22 from the cluster intermittently timed out). GitHub's host keys are pinned in `backend/src/git.rs`.
 - **Sync.** It fetches and fast-forwards every `LLM_WIKI_SYNC_SECONDS` (60) seconds and before every write. The clone
   never holds unpushed work: a failed push is reset away, and the client keeps the edit as a draft. If the remote is
   rewritten, the clone follows it.
