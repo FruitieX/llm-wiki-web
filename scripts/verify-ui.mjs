@@ -247,7 +247,10 @@ try {
   await box.click()
   await page.waitForSelector('text=Saved >> visible=true', { timeout: 90000 })
   await page.waitForTimeout(2500)
-  check((await box.isChecked()) === wasChecked, 'a second toggle sticks after the refetch')
+  check(
+    (await box.isChecked()) === wasChecked,
+    'a second toggle sticks after the refetch',
+  )
   await page.screenshot({ path: join(out, 'desktop-checkbox.png') })
 
   // History and diff.
