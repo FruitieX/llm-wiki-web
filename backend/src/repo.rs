@@ -160,7 +160,12 @@ impl Repo {
         let _guard = self.lock.lock().await;
         if !self.git.dir.join(".git").exists() {
             tracing::info!("Cloning {} ({})", self.url, self.branch);
-            self.git.clone_from(&self.url, &self.branch).await?;
+            if let Err(error) = self.git.clone_from(&self.url, &self.branch).await {
+                // A clone killed by the timeout leaves a partial repository
+                // behind; remove it so the retry starts clean.
+                let _ = tokio::fs::remove_dir_all(&self.git.dir).await;
+                return Err(error);
+            }
         } else {
             self.git
                 .run(&["remote", "set-url", "origin", &self.url])
