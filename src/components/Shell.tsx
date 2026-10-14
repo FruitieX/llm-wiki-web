@@ -25,6 +25,7 @@ import { useTheme } from '../lib/theme'
 import { FOLDERS, folderOf, relativeTime } from '../lib/wiki'
 import { Mark } from './Mark'
 import { SearchDialog } from './Search'
+import { SaveToasts } from './SaveToasts'
 import { PasswordDialog } from './Password'
 import { Loading } from './States'
 
@@ -123,6 +124,7 @@ export function Shell() {
         </main>
       </div>
       <SearchDialog open={searchOpen} onOpenChange={setSearchOpen} />
+      <SaveToasts />
     </div>
   )
 }

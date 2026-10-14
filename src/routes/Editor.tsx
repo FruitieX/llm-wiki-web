@@ -14,6 +14,7 @@ import {
   Eye,
   FolderInput,
   GitMerge,
+  LoaderCircle,
   PenLine,
   X,
 } from 'lucide-react'
@@ -42,6 +43,7 @@ import {
   stripTitle,
   today,
 } from '../lib/wiki'
+import { trackSave } from '../lib/saves'
 import { CodeEditor, type Completions } from '../components/CodeEditor'
 import { Markdown } from '../components/Markdown'
 import { Loading, NotFound, Problem } from '../components/States'
@@ -161,7 +163,15 @@ function EditorBody({
   const [view, setView] = useState<View>(() =>
     window.matchMedia('(min-width: 1024px)').matches ? 'split' : 'write',
   )
-  const [saveOpen, setSaveOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [problem, setProblem] = useState<CheckDelta | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const sections = wiki.data?.sections ?? []
+  const [section, setSection] = useState<string | null>(null)
+  const [description, setDescription] = useState('')
+  const indexSection =
+    section ??
+    (sections.includes(FOLDERS[folder]) ? FOLDERS[folder] : (sections[0] ?? ''))
   const [moveOpen, setMoveOpen] = useState(false)
   const [conflict, setConflict] = useState<{
     details: ConflictDetails
@@ -231,6 +241,65 @@ function EditorBody({
     writeDraft(storageKey, null)
     client.invalidateQueries()
     navigate({ to: '/page/$', params: { _splat: destination } })
+  }
+
+  const pageKey = mode === 'edit' ? page!.key : newKey
+  const validNew = /^[a-z0-9]+(-[a-z0-9]+)*$/.test(slug) && !keys.has(newKey)
+  const canSave = !saving && (mode === 'edit' ? dirty : validNew)
+
+  /**
+   * One tap: the server validates and commits at once, then names the commit
+   * (via Hermes) and pushes in the background. The draft stays on this device
+   * until the push is confirmed.
+   */
+  async function save(override?: { text: string; blob: string }) {
+    if (saving) return
+    setSaving(true)
+    setSaveError(null)
+    const finalText = setUpdated(override?.text ?? text)
+    const blob = override?.blob ?? baseBlob
+    try {
+      const result =
+        mode === 'edit'
+          ? await api<Committed>('/api/page', {
+              method: 'PUT',
+              body: { key: pageKey, text: finalText, baseBlob: blob },
+            })
+          : await api<Committed>('/api/page', {
+              method: 'POST',
+              body: {
+                key: pageKey,
+                text: finalText,
+                section: indexSection || null,
+                description,
+              },
+            })
+      if (result.save !== null) {
+        writeDraft(storageKey, {
+          text: finalText,
+          baseBlob: blob,
+          savedAt: Date.now(),
+        })
+        trackSave({
+          id: result.save,
+          key: pageKey,
+          title: preview.title ?? pageKey,
+          draftKey: storageKey,
+          warnings: result.warnings,
+        })
+        leaving.current = true
+        client.invalidateQueries()
+        navigate({ to: '/page/$', params: { _splat: pageKey } })
+      } else finish(pageKey)
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && e.details?.path)
+        setConflict({ details: e.details, mine: finalText })
+      else if (e instanceof ApiError && e.status === 422 && e.details?.check)
+        setProblem(e.details.check)
+      else setSaveError(e instanceof ApiError ? e.message : 'Saving failed.')
+    } finally {
+      setSaving(false)
+    }
   }
 
   const close = () => {
@@ -313,10 +382,15 @@ function EditorBody({
         )}
         <button
           className="btn primary"
-          onClick={() => setSaveOpen(true)}
-          disabled={(mode === 'edit' && !dirty) || (mode === 'new' && !slug)}
+          onClick={() => save()}
+          disabled={!canSave}
         >
-          <Check size={16} /> Save
+          {saving ? (
+            <LoaderCircle size={16} className="animate-spin" />
+          ) : (
+            <Check size={16} />
+          )}
+          {saving ? 'Saving' : 'Save'}
         </button>
       </header>
 
@@ -331,6 +405,11 @@ function EditorBody({
           templates={templates.map((item) => item.name)}
           exists={keys.has(newKey)}
           touched={touched}
+          sections={sections}
+          section={indexSection}
+          setSection={setSection}
+          description={description}
+          setDescription={setDescription}
         />
       )}
 
@@ -352,6 +431,11 @@ function EditorBody({
           </button>
         </Banner>
       )}
+      {saveError && (
+        <Banner tone="warn" onClose={() => setSaveError(null)}>
+          {saveError}
+        </Banner>
+      )}
       {upstreamMoved && (
         <Banner tone="warn">
           This page changed upstream since you started editing. Saving will show
@@ -369,9 +453,7 @@ function EditorBody({
               setText(value)
               setTouched(true)
             }}
-            onSave={() =>
-              (mode === 'new' ? !!slug : dirty) && setSaveOpen(true)
-            }
+            onSave={() => canSave && save()}
             completions={completions}
             autoFocus={
               !draftNotice && window.matchMedia('(pointer: fine)').matches
@@ -397,25 +479,28 @@ function EditorBody({
         </section>
       </div>
 
-      <SaveDialog
-        open={saveOpen}
-        onOpenChange={setSaveOpen}
-        mode={mode}
-        pageKey={mode === 'edit' ? page!.key : newKey}
-        text={text}
-        baseBlob={baseBlob}
-        sections={wiki.data?.sections ?? []}
-        folder={folder}
-        onSaved={(result, finalText, destination) => {
-          setText(finalText)
-          finish(destination)
-          void result
-        }}
-        onConflict={(details) => {
-          setSaveOpen(false)
-          setConflict({ details, mine: text })
-        }}
-      />
+      <Dialog.Root
+        open={!!problem}
+        onOpenChange={(open) => !open && setProblem(null)}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog p-5" aria-describedby={undefined}>
+            <Dialog.Title className="font-serif text-lg font-semibold">
+              Not saved: the wiki check found errors
+            </Dialog.Title>
+            <p className="mt-1 text-sm text-ink-2">
+              Fix these and save again. Your text is still in the editor.
+            </p>
+            <div className="mt-4">
+              {problem && <CheckList check={problem} />}
+            </div>
+            <div className="mt-6 flex justify-end">
+              <Dialog.Close className="btn primary">Keep editing</Dialog.Close>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
       {mode === 'edit' && (
         <MoveDialog
           open={moveOpen}
@@ -435,7 +520,7 @@ function EditorBody({
             setBaseBlob(blob)
             setTouched(true)
             setConflict(null)
-            setSaveOpen(true)
+            void save({ text: merged, blob })
           }}
         />
       )}
@@ -487,6 +572,11 @@ function NewPageFields(props: {
   templates: string[]
   exists: boolean
   touched: boolean
+  sections: string[]
+  section: string
+  setSection: (value: string) => void
+  description: string
+  setDescription: (value: string) => void
 }) {
   const valid = !props.slug || /^[a-z0-9]+(-[a-z0-9]+)*$/.test(props.slug)
   return (
@@ -557,6 +647,35 @@ function NewPageFields(props: {
             ))}
           </select>
         </div>
+        <div>
+          <label className="label" htmlFor="index-section">
+            Index section
+          </label>
+          <select
+            id="index-section"
+            className="field h-9 w-auto"
+            value={props.section}
+            onChange={(e) => props.setSection(e.target.value)}
+          >
+            {props.sections.map((name) => (
+              <option key={name}>{name}</option>
+            ))}
+            <option value="">Don't list it</option>
+          </select>
+        </div>
+        <div className="min-w-[14rem] flex-[2]">
+          <label className="label" htmlFor="index-description">
+            Index line
+          </label>
+          <input
+            id="index-description"
+            className="field h-9"
+            value={props.description}
+            onChange={(e) => props.setDescription(e.target.value)}
+            placeholder="One line on what the page covers"
+            disabled={!props.section}
+          />
+        </div>
       </div>
       {(!valid || props.exists) && (
         <p className="mx-auto mt-2 max-w-5xl text-sm text-danger">
@@ -605,237 +724,6 @@ function CheckList({ check }: { check: CheckDelta }) {
         </details>
       )}
     </div>
-  )
-}
-
-function SaveDialog(props: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  mode: 'edit' | 'new'
-  pageKey: string
-  text: string
-  baseBlob: string | null
-  sections: string[]
-  folder: string
-  onSaved: (result: Committed, text: string, destination: string) => void
-  onConflict: (details: ConflictDetails) => void
-}) {
-  const { open, mode, pageKey, text } = props
-  const area = areaFor(pageKey)
-  // Until the owner types a message, it follows the page path.
-  const [typed, setMessage] = useState<string | null>(null)
-  const message =
-    typed ?? (mode === 'new' ? `docs(${area}): add page` : `docs(${area}): `)
-  const [bump, setBump] = useState(true)
-  const defaultSection =
-    FOLDERS[props.folder] && props.sections.includes(FOLDERS[props.folder])
-      ? FOLDERS[props.folder]
-      : (props.sections[0] ?? '')
-  const [section, setSection] = useState(defaultSection)
-  const [description, setDescription] = useState('')
-  const [check, setCheck] = useState<CheckDelta | null>(null)
-  const [checking, setChecking] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
-  const finalText = bump ? setUpdated(text) : text
-
-  useEffect(() => {
-    if (!open) return
-    setError(null)
-    setSection((current) => current || defaultSection)
-  }, [open, defaultSection])
-
-  // Validate with the wiki's own checker whenever the dialog opens.
-  useEffect(() => {
-    if (!open) return
-    const controller = new AbortController()
-    setChecking(true)
-    setCheck(null)
-    api<{ check: CheckDelta }>('/api/check', {
-      method: 'POST',
-      body: { changes: [{ key: pageKey, text: finalText }] },
-      signal: controller.signal,
-    })
-      .then((result) => setCheck(result.check))
-      .catch((e) => {
-        if ((e as Error).name !== 'AbortError')
-          setError(e instanceof ApiError ? e.message : 'The check failed.')
-      })
-      .finally(() => setChecking(false))
-    return () => controller.abort()
-  }, [open, pageKey, finalText])
-
-  // The checker warns about pages missing from index.md; a new page with an
-  // index section will be listed, so leave that warning out.
-  const shown = check && {
-    ...check,
-    warnings: check.warnings.filter(
-      (w) =>
-        !(
-          mode === 'new' &&
-          section &&
-          w.startsWith('not listed in wiki/index.md')
-        ),
-    ),
-  }
-
-  async function save() {
-    setBusy(true)
-    setError(null)
-    try {
-      const result =
-        mode === 'edit'
-          ? await api<Committed>('/api/page', {
-              method: 'PUT',
-              body: {
-                key: pageKey,
-                text: finalText,
-                baseBlob: props.baseBlob,
-                message,
-              },
-            })
-          : await api<Committed>('/api/page', {
-              method: 'POST',
-              body: {
-                key: pageKey,
-                text: finalText,
-                section: section || null,
-                description,
-                message,
-              },
-            })
-      props.onSaved(result, finalText, pageKey)
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 409 && e.details?.path)
-        props.onConflict(e.details)
-      else if (e instanceof ApiError && e.status === 422 && e.details?.check)
-        setCheck(e.details.check)
-      else setError(e instanceof ApiError ? e.message : 'Saving failed.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const subjectOk =
-    message.trim().length > 0 && !/^docs\([^)]*\):\s*$/.test(message.trim())
-  return (
-    <Dialog.Root open={open} onOpenChange={props.onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className="dialog p-5" aria-describedby={undefined}>
-          <Dialog.Title className="font-serif text-lg font-semibold">
-            {mode === 'new' ? 'Create page' : 'Save changes'}
-          </Dialog.Title>
-          <p className="mt-1 font-mono text-xs text-ink-3">wiki/{pageKey}.md</p>
-          <div className="mt-4 space-y-4">
-            <div>
-              <label className="label" htmlFor="commit-message">
-                Commit message
-              </label>
-              <input
-                id="commit-message"
-                className="field font-mono text-sm"
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                onKeyDown={(e) => {
-                  if (
-                    e.key === 'Enter' &&
-                    subjectOk &&
-                    !busy &&
-                    !checking &&
-                    !check?.errors.length
-                  )
-                    save()
-                }}
-                autoFocus
-                autoCapitalize="off"
-              />
-            </div>
-            {mode === 'new' && (
-              <div className="grid gap-3 sm:grid-cols-[10rem_1fr]">
-                <div>
-                  <label className="label" htmlFor="index-section">
-                    Index section
-                  </label>
-                  <select
-                    id="index-section"
-                    className="field"
-                    value={section}
-                    onChange={(e) => setSection(e.target.value)}
-                  >
-                    {props.sections.map((name) => (
-                      <option key={name}>{name}</option>
-                    ))}
-                    <option value="">Don't list it</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="label" htmlFor="index-description">
-                    Index description
-                  </label>
-                  <input
-                    id="index-description"
-                    className="field"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="One line on what the page covers."
-                    disabled={!section}
-                  />
-                </div>
-              </div>
-            )}
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={bump}
-                onChange={(e) => setBump(e.target.checked)}
-                className="accent-[var(--accent)]"
-              />
-              Set{' '}
-              <code className="rounded bg-sunk px-1 font-mono text-xs">
-                updated
-              </code>{' '}
-              to {today()}
-            </label>
-            <div>
-              <p className="label">Wiki check</p>
-              {checking ? (
-                <p className="text-sm text-ink-3">
-                  Running tools/wiki_check.js…
-                </p>
-              ) : shown ? (
-                shown.errors.length ||
-                shown.warnings.length ||
-                shown.existingErrors.length ? (
-                  <CheckList check={shown} />
-                ) : (
-                  <p className="flex items-center gap-1.5 text-sm text-ok">
-                    <Check size={15} /> No new errors or warnings.
-                  </p>
-                )
-              ) : null}
-            </div>
-            {error && (
-              <p className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-                {error}
-              </p>
-            )}
-          </div>
-          <div className="mt-6 flex justify-end gap-2">
-            <Dialog.Close className="btn ghost">Keep editing</Dialog.Close>
-            <button
-              className="btn primary"
-              onClick={save}
-              disabled={
-                busy || checking || !subjectOk || !!check?.errors.length
-              }
-            >
-              {busy ? 'Committing…' : 'Commit and push'}
-            </button>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
   )
 }
 

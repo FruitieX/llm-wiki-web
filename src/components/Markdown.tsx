@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { memo, useMemo, type ReactNode } from 'react'
+import { createContext, memo, useContext, useMemo, type ReactNode } from 'react'
 import ReactMarkdown, {
   defaultUrlTransform,
   type Components,
@@ -16,6 +16,9 @@ function textOf(node: ReactNode): string {
   return ''
 }
 
+/** The source offset of the task-list item being rendered. */
+const TaskOffset = createContext<number | null>(null)
+
 const urlTransform = (url: string) =>
   url.startsWith('wiki:') || url.startsWith('rawfile:')
     ? url
@@ -29,6 +32,7 @@ export const Markdown = memo(function Markdown({
   text,
   keys,
   titles,
+  onToggleTask,
   rawPaths,
   compact = false,
   currentKey,
@@ -37,6 +41,8 @@ export const Markdown = memo(function Markdown({
   keys: Set<string>
   /** Page titles, shown for links written without a label. */
   titles?: Map<string, string>
+  /** Makes task-list checkboxes clickable; gets the item's offset in `text`. */
+  onToggleTask?: (offset: number) => void
   rawPaths?: Set<string>
   compact?: boolean
   currentKey?: string
@@ -53,6 +59,29 @@ export const Markdown = memo(function Markdown({
       h2: heading('h2'),
       h3: heading('h3'),
       h4: heading('h4'),
+      li: ({ node, className, children }) => {
+        const offset = node?.position?.start.offset
+        const item = <li className={className}>{children}</li>
+        return className?.includes('task-list-item') && offset !== undefined ? (
+          <TaskOffset.Provider value={offset}>{item}</TaskOffset.Provider>
+        ) : (
+          item
+        )
+      },
+      input: function TaskBox({ type, checked }) {
+        const offset = useContext(TaskOffset)
+        if (type !== 'checkbox') return <input type={type} />
+        const enabled = !!onToggleTask && offset !== null
+        return (
+          <input
+            type="checkbox"
+            checked={!!checked}
+            disabled={!enabled}
+            onChange={() => enabled && onToggleTask!(offset!)}
+            aria-label={checked ? 'Mark as not done' : 'Mark as done'}
+          />
+        )
+      },
       table: ({ children }) => (
         <div className="table-wrap">
           <table>{children}</table>
@@ -123,7 +152,7 @@ export const Markdown = memo(function Markdown({
     }
     // The heading id counter must restart on every render of new text.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keys, titles, rawPaths, currentKey, text])
+  }, [keys, titles, rawPaths, currentKey, text, onToggleTask])
   return (
     <div className={`prose-wiki${compact ? ' compact' : ''}`}>
       <ReactMarkdown

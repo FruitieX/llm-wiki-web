@@ -292,7 +292,17 @@ button:disabled {
 }
 .prose-wiki input[type='checkbox'] {
   accent-color: var(--accent);
-  margin-right: 0.4em;
+  width: 1.05em;
+  height: 1.05em;
+  margin: 0 0.5em 0 0;
+  vertical-align: -0.15em;
+  cursor: pointer;
+}
+.prose-wiki input[type='checkbox']:disabled {
+  cursor: default;
+}
+.prose-wiki li.task-list-item:has(> input:checked, > p > input:checked) {
+  color: var(--ink-3);
 }
 .prose-wiki li:has(> input[type='checkbox']) {
   list-style: none;
@@ -387,6 +397,11 @@ button:disabled {
   color: var(--ink);
 }
 
+.bare-input:focus-visible,
+.field:focus-visible {
+  outline: none;
+}
+
 .field {
   width: 100%;
   height: 2.5rem;
@@ -397,7 +412,11 @@ button:disabled {
   color: var(--ink);
   font-size: 0.95rem;
 }
-textarea.field {
+textarea.bare-input:focus-visible {
+  outline: none;
+}
+
+.field {
   height: auto;
   padding: 0.6rem 0.75rem;
   line-height: 1.5;
@@ -473,6 +492,12 @@ textarea.field {
   from {
     opacity: 0;
     transform: translate(-50%, 6px);
+  }
+}
+@keyframes rise-toast {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
   }
 }
 @keyframes sheet-in {

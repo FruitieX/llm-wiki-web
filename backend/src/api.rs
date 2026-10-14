@@ -1,7 +1,7 @@
 use crate::{
     AppState,
     error::{ApiError, Result},
-    repo::{CommitError, Committed, Op},
+    repo::{CommitError, Committed, Message, Op},
     wiki::{self, Page, Snapshot},
 };
 use axum::{
@@ -28,18 +28,41 @@ fn checked_key(key: &str) -> Result<String> {
     }
 }
 
-fn checked_message(message: &str) -> Result<String> {
-    let message = message.trim();
-    let subject = message.lines().next().unwrap_or("");
-    if subject.is_empty() {
-        return Err(ApiError::bad("Write a commit message."));
-    }
-    if subject.chars().count() > 120 || message.len() > 4000 {
+/// The commit subject: the client's when given, otherwise `fallback`, which
+/// Hermes may then improve in the background.
+fn message(given: Option<&str>, fallback: String) -> Result<Message> {
+    let Some(given) = given.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(Message {
+            subject: fallback,
+            generate: true,
+        });
+    };
+    let subject = given.lines().next().unwrap_or("");
+    if subject.chars().count() > 120 || given.len() > 4000 {
         return Err(ApiError::bad(
             "Keep the commit subject under 120 characters.",
         ));
     }
-    Ok(format!("{message}\n"))
+    Ok(Message {
+        subject: given.to_string(),
+        generate: false,
+    })
+}
+
+/// `docs(<area>)` uses the page's file name, as the wiki's history does.
+fn area(key: &str) -> &str {
+    match key.rsplit('/').next().unwrap_or(key) {
+        "index" => "wiki",
+        name => name,
+    }
+}
+
+fn title_of(text: &str, key: &str) -> String {
+    let (_, body) = wiki::split_frontmatter(text);
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("# "))
+        .map(|title| title.trim().to_string())
+        .unwrap_or_else(|| key.to_string())
 }
 
 fn checked_rev(rev: &str) -> Result<&str> {
@@ -374,19 +397,22 @@ pub struct SaveRequest {
     key: String,
     text: String,
     base_blob: String,
-    message: String,
+    message: Option<String>,
 }
 pub async fn save(
     State(state): State<AppState>,
     Json(body): Json<SaveRequest>,
 ) -> Result<Json<Value>> {
     let key = checked_key(&body.key)?;
-    let message = checked_message(&body.message)?;
     let path = page_path(&key);
     let text = normalize_text(&body.text);
+    let message = message(
+        body.message.as_deref(),
+        format!("docs({}): update {}", area(&key), title_of(&text, &key)),
+    )?;
     let result = state
         .repo
-        .commit(&message, |_| {
+        .commit(message, |_| {
             Ok((
                 vec![Op::Write {
                     path: path.clone(),
@@ -457,7 +483,7 @@ pub struct CreateRequest {
     text: String,
     section: Option<String>,
     description: Option<String>,
-    message: String,
+    message: Option<String>,
 }
 pub async fn create(
     State(state): State<AppState>,
@@ -467,12 +493,15 @@ pub async fn create(
     if key == "index" {
         return Err(ApiError::bad("That page already exists."));
     }
-    let message = checked_message(&body.message)?;
     let path = page_path(&key);
     let text = normalize_text(&body.text);
+    let message = message(
+        body.message.as_deref(),
+        format!("docs({}): add {}", area(&key), title_of(&text, &key)),
+    )?;
     let result = state
         .repo
-        .commit(&message, |snapshot| {
+        .commit(message, |snapshot| {
             if snapshot.pages.contains_key(&key) {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
@@ -507,7 +536,7 @@ pub struct MoveRequest {
     from: String,
     to: String,
     base_blob: String,
-    message: String,
+    message: Option<String>,
 }
 pub async fn rename(
     State(state): State<AppState>,
@@ -523,10 +552,15 @@ pub async fn rename(
             "The index and agent-start pages keep their paths.",
         ));
     }
-    let message = checked_message(&body.message)?;
+    // A move is mechanical; its subject needs no model.
+    let mut message = message(
+        body.message.as_deref(),
+        format!("docs({}): move {from} to {to}", area(&to)),
+    )?;
+    message.generate = false;
     let result = state
         .repo
-        .commit(&message, |snapshot| {
+        .commit(message, |snapshot| {
             let Some(page) = snapshot.pages.get(&from) else {
                 return Err(CommitError::Conflict {
                     path: page_path(&from),

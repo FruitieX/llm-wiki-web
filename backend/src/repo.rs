@@ -1,9 +1,13 @@
 //! The app's own clone of the wiki. Every read of the working tree that must
-//! be consistent, and every write, happens while holding `lock`. The local
-//! branch never keeps commits that are not on the remote: a failed push is
-//! reset away, so the clone always mirrors GitHub.
+//! be consistent, and every write, happens while holding `lock`.
+//!
+//! A save commits locally and answers at once; a background finisher, still
+//! holding the lock, lets Hermes rewrite the commit subject and pushes. Once
+//! the lock is free the clone holds no unpushed work again: a failed push is
+//! reset away (the client keeps the edit as a draft until the push lands).
 
 use crate::{
+    ai::Ai,
     check::{self, CheckDelta, CheckResult},
     error::ApiError,
     git::{Git, GitError},
@@ -13,7 +17,7 @@ use axum::http::StatusCode;
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
 };
@@ -24,7 +28,8 @@ pub struct Repo {
     pub branch: String,
     pub scratch: PathBuf,
     pub node: String,
-    lock: tokio::sync::Mutex<()>,
+    pub ai: Option<Ai>,
+    lock: Arc<tokio::sync::Mutex<()>>,
     snapshot: RwLock<Arc<Snapshot>>,
     status: Mutex<SyncStatus>,
     baseline: tokio::sync::Mutex<Option<(String, CheckResult)>>,
@@ -37,6 +42,25 @@ pub struct SyncStatus {
     pub branch: String,
     pub last_sync: Option<i64>,
     pub last_error: Option<String>,
+    /// The most recent saves, newest last, so a client can follow its own.
+    pub saves: VecDeque<SaveState>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveState {
+    pub id: u64,
+    pub paths: Vec<String>,
+    /// `pushing`, `pushed` or `failed`.
+    pub state: &'static str,
+    pub subject: String,
+    pub error: Option<String>,
+}
+
+/// The commit subject for a save. With `generate`, Hermes may replace it.
+pub struct Message {
+    pub subject: String,
+    pub generate: bool,
 }
 
 /// One change to a file below `wiki/`.
@@ -103,6 +127,10 @@ pub struct Committed {
     pub head: String,
     pub commit: Option<String>,
     pub warnings: Vec<String>,
+    /// Follow this id in `SyncStatus::saves` until it is pushed.
+    pub save: Option<u64>,
+    /// The new blob of each written page, for further edits without a reload.
+    pub blobs: BTreeMap<String, String>,
 }
 
 fn offline(error: GitError) -> ApiError {
@@ -122,14 +150,22 @@ fn rejected(error: &GitError) -> bool {
 }
 
 impl Repo {
-    pub fn new(git: Git, url: String, branch: String, scratch: PathBuf, node: String) -> Self {
+    pub fn new(
+        git: Git,
+        url: String,
+        branch: String,
+        scratch: PathBuf,
+        node: String,
+        ai: Option<Ai>,
+    ) -> Self {
         Repo {
             git,
             url,
             branch,
             scratch,
             node,
-            lock: tokio::sync::Mutex::new(()),
+            ai,
+            lock: Arc::new(tokio::sync::Mutex::new(())),
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
             status: Mutex::new(SyncStatus::default()),
             baseline: tokio::sync::Mutex::new(None),
@@ -303,20 +339,44 @@ impl Repo {
         Ok(check::delta(&before, &after, &touched))
     }
 
+    /// Waits until no save is being finished (tests and shutdown).
+    pub async fn settled(&self) {
+        let _ = self.lock.lock().await;
+    }
+
+    fn record_save(&self, save: SaveState) {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = status.saves.iter_mut().find(|s| s.id == save.id) {
+            *existing = save;
+            return;
+        }
+        status.saves.push_back(save);
+        while status.saves.len() > 20 {
+            status.saves.pop_front();
+        }
+    }
+
     /// Pulls, verifies that each expected path still has the blob the client
-    /// started from, validates, commits and pushes.
+    /// started from, validates and commits locally, then returns while a
+    /// background task finishes the commit subject and pushes.
     /// `build` turns the freshly pulled snapshot into the change and the blob
     /// each path must still have (`None`: must not exist).
-    pub async fn commit<F>(&self, message: &str, build: F) -> Result<Committed, CommitError>
+    pub async fn commit<F>(
+        self: &Arc<Self>,
+        message: Message,
+        build: F,
+    ) -> Result<Committed, CommitError>
     where
         F: FnOnce(&Snapshot) -> Result<(Vec<Op>, Vec<(String, Option<String>)>), CommitError>,
     {
-        let _guard = self.lock.lock().await;
+        let guard = self.lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
         if let Err(error) = self.pull_locked().await {
             self.mark_synced(Some(error.to_string()));
             return Err(offline(error).into());
         }
         self.mark_synced(None);
+        let pulled = started.elapsed();
         let snapshot = self.snapshot();
         let (ops, expected) = build(&snapshot)?;
         for (path, blob) in &expected {
@@ -355,27 +415,135 @@ impl Repo {
                 head: snapshot.head.clone(),
                 commit: None,
                 warnings: delta.warnings,
+                save: None,
+                blobs: BTreeMap::new(),
             });
         }
+        let subject = format!("{}\n", message.subject.trim());
         self.git
-            .run_with_input(&["commit", "--quiet", "-F", "-"], message.as_bytes())
+            .run_with_input(&["commit", "--quiet", "-F", "-"], subject.as_bytes())
             .await?;
+        self.reload().await?;
+        let snapshot = self.snapshot();
+        let blobs = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Write { path, .. } => snapshot
+                    .page_by_path(path)
+                    .map(|page| (path.clone(), page.blob.clone())),
+                Op::Delete { .. } => None,
+            })
+            .collect();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let paths: Vec<String> = ops.iter().map(|op| op.path().to_string()).collect();
+        self.record_save(SaveState {
+            id,
+            paths: paths.clone(),
+            state: "pushing",
+            subject: message.subject.trim().to_string(),
+            error: None,
+        });
+        tracing::info!(
+            "Committed save {id} locally in {} ms (pull {} ms)",
+            started.elapsed().as_millis(),
+            pulled.as_millis()
+        );
+        let repo = self.clone();
+        tokio::spawn(async move {
+            repo.finish(guard, id, paths, ops, message.subject, message.generate)
+                .await
+        });
+        Ok(Committed {
+            commit: Some(snapshot.head.clone()),
+            head: snapshot.head.clone(),
+            warnings: delta.warnings,
+            save: Some(id),
+            blobs,
+        })
+    }
+
+    /// Runs with the repository lock still held: improve the subject, push,
+    /// and leave the clone equal to the remote whatever happens.
+    async fn finish(
+        self: Arc<Self>,
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+        id: u64,
+        paths: Vec<String>,
+        ops: Vec<Op>,
+        mut subject: String,
+        generate: bool,
+    ) {
+        let started = std::time::Instant::now();
+        if generate && let Some(ai) = &self.ai {
+            let area = paths
+                .first()
+                .and_then(|path| path.rsplit('/').next())
+                .and_then(|name| name.strip_suffix(".md"))
+                .map(|name| if name == "index" { "wiki" } else { name })
+                .unwrap_or("wiki")
+                .to_string();
+            let diff = self
+                .git
+                .run(&["show", "--format=", "--unified=2", "HEAD"])
+                .await
+                .unwrap_or_default();
+            let examples: Vec<String> = self
+                .git
+                .run(&["log", "-12", "--format=%s", "HEAD~1"])
+                .await
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if let Some(better) = ai.commit_subject(&area, &diff, &examples).await {
+                let input = format!("{better}\n");
+                match self
+                    .git
+                    .run_with_input(
+                        &["commit", "--amend", "--quiet", "-F", "-"],
+                        input.as_bytes(),
+                    )
+                    .await
+                {
+                    Ok(_) => subject = better,
+                    Err(error) => tracing::warn!("{error}"),
+                }
+            }
+        }
         let result = self.push_with_retry(&ops).await;
+        let error = match &result {
+            Ok(()) => None,
+            Err(CommitError::Conflict { .. }) => Some(
+                "The page changed upstream at the same time. Open the editor to merge your edit."
+                    .to_string(),
+            ),
+            Err(_) => Some(
+                "Could not push to GitHub. Your edit is kept on this device; save it again."
+                    .to_string(),
+            ),
+        };
         if result.is_err() {
-            // Never keep unpushed work: the client still holds the edit.
             let remote = self.remote_ref();
             let _ = self.git.run(&["rebase", "--abort"]).await;
             let _ = self.git.run(&["reset", "--hard", "--quiet", &remote]).await;
         }
-        self.reload().await?;
+        if let Err(error) = self.reload().await {
+            tracing::error!("{error}");
+        }
         self.mark_synced(None);
-        result?;
-        let head = self.snapshot().head.clone();
-        Ok(Committed {
-            commit: Some(head.clone()),
-            head,
-            warnings: delta.warnings,
-        })
+        tracing::info!(
+            "Save {id} {} in {} ms: {subject}",
+            if error.is_none() { "pushed" } else { "failed" },
+            started.elapsed().as_millis()
+        );
+        self.record_save(SaveState {
+            id,
+            paths,
+            state: if error.is_none() { "pushed" } else { "failed" },
+            subject,
+            error,
+        });
     }
 
     async fn push_with_retry(&self, ops: &[Op]) -> Result<(), CommitError> {

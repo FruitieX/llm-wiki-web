@@ -19,6 +19,7 @@ import {
 } from '../lib/wiki'
 import { FrontChips, TypeChip } from '../components/Chips'
 import { Markdown } from '../components/Markdown'
+import { useTaskToggle } from '../lib/tasks'
 import { Loading, NotFound, Problem } from '../components/States'
 
 export function PageView() {
@@ -34,6 +35,7 @@ export function PageView() {
     () => new Set(wiki.data?.raw.map((file) => file.path) ?? []),
     [wiki.data],
   )
+  const toggle = useTaskToggle(page.data)
   const body = useMemo(
     () => (page.data ? stripTitle(splitFrontmatter(page.data.text).body) : ''),
     [page.data],
@@ -184,6 +186,9 @@ export function PageView() {
               )}
 
               <Markdown
+                onToggleTask={(offset) =>
+                  toggle(page.data!.text.length - body.length, offset)
+                }
                 text={body}
                 keys={keys}
                 titles={titles}

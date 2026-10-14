@@ -118,24 +118,32 @@ try {
       ),
     'preview renders the new link',
   )
-  await page.click('button:has-text("Save")')
-  await page.fill(
-    '#commit-message',
-    'docs(verification-boundaries): link the home network page',
-  )
-  await page.waitForSelector(
-    'button:has-text("Commit and push"):not([disabled])',
-    { timeout: 20000 },
-  )
-  await page.screenshot({ path: join(out, 'desktop-save.png') })
-  await page.click('button:has-text("Commit and push")')
+  // One tap: no dialog; the page opens and a toast follows the push.
+  const tapped = Date.now()
+  await page.click('header button:has-text("Save")')
   await page.waitForURL(new RegExp(`/page/${target}$`), { timeout: 20000 })
+  const answered = Date.now() - tapped
+  check(
+    await page.waitForSelector(`.prose-wiki p:has-text("Run ${stamp}")`).then(
+      () => true,
+      () => false,
+    ),
+    `the page shows the edit right after Save (${answered} ms)`,
+  )
+  await page.screenshot({ path: join(out, 'desktop-saving.png') })
+  await page.waitForSelector('text=Saved >> visible=true', { timeout: 90000 })
+  const pushed = Date.now() - tapped
+  await page.screenshot({ path: join(out, 'desktop-saved.png') })
   if (agent) {
     git('pull', '-q', '--ff-only')
+    const subject = git('log', '-1', '--format=%s').trim()
     check(
-      git('log', '-1', '--format=%s').trim() ===
-        'docs(verification-boundaries): link the home network page',
-      'the save is a commit on the remote',
+      /^docs\(verification-boundaries\): /.test(subject),
+      `the save is a commit on the remote after ${pushed} ms: ${subject}`,
+    )
+    check(
+      git('show', 'HEAD:wiki/' + target + '.md').includes(`Run ${stamp}`),
+      'the remote has the edit',
     )
   }
 
@@ -145,14 +153,19 @@ try {
   await page.click('.cm-content')
   await page.keyboard.press('Control+End')
   await page.keyboard.type('\n\n[[entities/does-not-exist]]')
-  await page.click('button:has-text("Save")')
+  await page.click('header button:has-text("Save")')
   await page.waitForSelector('text=broken wiki link', { timeout: 20000 })
   check(
-    await page.locator('button:has-text("Commit and push")').isDisabled(),
+    (await page
+      .locator('text=Not saved: the wiki check found errors')
+      .count()) === 1 && page.url().includes('/edit/'),
     'a new broken link blocks the save',
   )
+  await page.waitForTimeout(300)
   await page.screenshot({ path: join(out, 'desktop-check-error.png') })
   await page.keyboard.press('Escape')
+  // Leave without saving (the draft is kept; discard it below).
+  page.once('dialog', (dialog) => dialog.accept())
 
   if (agent) {
     // Concurrent edit: start editing, an agent pushes to the same page, then save.
@@ -164,12 +177,10 @@ try {
       .catch(() => {})
     await page.waitForSelector('.cm-content')
     await page.click('.cm-content')
-    await page.keyboard.press('Control+Home')
-    await page.keyboard.press('ArrowDown')
-    await page.keyboard.press('End')
     const file = join(agent, 'wiki', `${target}.md`)
     // The agent edits an early line; the owner appends at the end, so git can
     // combine both and the merge view starts from the combined text.
+    git('pull', '-q', '--ff-only')
     const before = readFileSync(file, 'utf8')
     const firstParagraph = before
       .split('\n')
@@ -182,16 +193,7 @@ try {
     git('push', '-q')
     await page.keyboard.press('Control+End')
     await page.keyboard.type('\nThe owner added this line.')
-    await page.click('button:has-text("Save")')
-    await page.fill(
-      '#commit-message',
-      'docs(verification-boundaries): owner edit',
-    )
-    await page.waitForSelector(
-      'button:has-text("Commit and push"):not([disabled])',
-      { timeout: 20000 },
-    )
-    await page.click('button:has-text("Commit and push")')
+    await page.click('header button:has-text("Save")')
     await page.waitForSelector('text=Someone else changed this page', {
       timeout: 20000,
     })
@@ -203,13 +205,8 @@ try {
     await page.waitForTimeout(400)
     await page.screenshot({ path: join(out, 'desktop-merge.png') })
     await page.click('button:has-text("Use this version")')
-    await page.waitForSelector('#commit-message')
-    await page.waitForSelector(
-      'button:has-text("Commit and push"):not([disabled])',
-      { timeout: 20000 },
-    )
-    await page.click('button:has-text("Commit and push")')
     await page.waitForURL(new RegExp(`/page/${target}$`), { timeout: 20000 })
+    await page.waitForSelector('text=Saved >> visible=true', { timeout: 90000 })
     git('pull', '-q', '--ff-only')
     const merged = readFileSync(file, 'utf8')
     check(
@@ -218,6 +215,40 @@ try {
       'both edits survive the merge',
     )
   }
+
+  // Checkboxes on a page save straight away.
+  await page.goto(`${base}/page/personal/todo`)
+  const box = page.locator('.prose-wiki input[type=checkbox]').first()
+  await box.waitFor()
+  const wasChecked = await box.isChecked()
+  await box.click()
+  const flipped = await page
+    .waitForFunction(
+      (was) =>
+        document.querySelector('.prose-wiki input[type=checkbox]')?.checked !==
+        was,
+      wasChecked,
+      { timeout: 1000 },
+    )
+    .then(
+      () => true,
+      () => false,
+    )
+  check(flipped, 'a checkbox toggles immediately')
+  await page.waitForSelector('text=Saved >> visible=true', { timeout: 90000 })
+  if (agent) {
+    git('pull', '-q', '--ff-only')
+    const subject = git('log', '-1', '--format=%s').trim()
+    check(
+      /^docs\(todo\): (un)?check "/.test(subject),
+      `the checkbox is a commit: ${subject}`,
+    )
+  }
+  await box.click()
+  await page.waitForSelector('text=Saved >> visible=true', { timeout: 90000 })
+  await page.waitForTimeout(2500)
+  check((await box.isChecked()) === wasChecked, 'a second toggle sticks after the refetch')
+  await page.screenshot({ path: join(out, 'desktop-checkbox.png') })
 
   // History and diff.
   await page.goto(`${base}/history/${target}`)

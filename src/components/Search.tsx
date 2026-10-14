@@ -116,7 +116,7 @@ export function SearchDialog({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search titles and text…"
-              className="h-14 flex-1 bg-transparent text-base outline-none placeholder:text-ink-3"
+              className="bare-input h-14 min-w-0 flex-1 bg-transparent text-base placeholder:text-ink-3"
               enterKeyHint="go"
               aria-label="Search"
             />

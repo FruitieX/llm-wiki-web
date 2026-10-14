@@ -13,8 +13,14 @@ editor. It has no database: **storage is git**.
 - **Sync.** It fetches and fast-forwards every `LLM_WIKI_SYNC_SECONDS` (60) seconds and before every write. The clone
   never holds unpushed work: a failed push is reset away, and the client keeps the edit as a draft. If the remote is
   rewritten, the clone follows it.
-- **Saves.** Each save is one commit (`docs(<area>): …`) authored as `LLM_WIKI_GIT_NAME <LLM_WIKI_GIT_EMAIL>`, then a
-  push. A rejected push is rebased onto the remote and retried.
+- **Saves.** One tap. The server pulls, checks for conflicts, validates and commits locally, then answers (about a
+  second). A background task, still holding the repository lock, asks the owner's Hermes agent
+  (`LLM_WIKI_AI_URL`, an OpenAI-compatible endpoint; `LLM_WIKI_AI_KEY`, `LLM_WIKI_AI_MODEL`) for a `docs(<area>): …`
+  subject, amends the unpushed commit with it, and pushes. A rejected push is rebased onto the remote and retried. A
+  push that still fails is reset away, and the client, which keeps the draft until the push is confirmed in
+  `/api/status`, offers to reopen the edit. Without Hermes, or when it is slow or answers oddly, saves keep the subject
+  `docs(<area>): update <title>`. Commits are authored as `LLM_WIKI_GIT_NAME <LLM_WIKI_GIT_EMAIL>`.
+- **Checkboxes** on a page are live: ticking one saves at once with the subject `docs(<area>): check "<item>"`.
 - **Concurrent edits.** The editor remembers the blob it started from. If the page changed upstream, the save returns
   409 with the upstream text and a `git merge-file` three-way merge. The owner reviews it in a CodeMirror merge view
   (accept or reject each chunk) and saves again. Nothing is overwritten silently.

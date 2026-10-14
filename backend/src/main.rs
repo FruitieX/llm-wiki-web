@@ -1,3 +1,4 @@
+mod ai;
 mod api;
 mod auth;
 mod check;
@@ -237,7 +238,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         author_email: env("LLM_WIKI_GIT_EMAIL").unwrap_or_else(|| "llm-wiki-web@localhost".into()),
     };
     let node = env("LLM_WIKI_NODE").unwrap_or_else(|| "node".into());
-    let repo = Arc::new(repo::Repo::new(git, url, branch, scratch, node));
+    // Optional: an OpenAI-compatible endpoint (the owner's Hermes agent) that
+    // writes commit subjects for saves made without one.
+    let ai = match env("LLM_WIKI_AI_URL") {
+        Some(url) => Some(ai::Ai::new(
+            url,
+            env("LLM_WIKI_AI_KEY"),
+            env("LLM_WIKI_AI_MODEL").unwrap_or_else(|| "hermes-agent".into()),
+        )?),
+        None => None,
+    };
+    let repo = Arc::new(repo::Repo::new(git, url, branch, scratch, node, ai));
     let setup_token = env("LLM_WIKI_SETUP_TOKEN");
     if setup_token.as_ref().is_some_and(|token| token.len() < 16) {
         return Err("LLM_WIKI_SETUP_TOKEN needs at least 16 characters".into());
@@ -293,5 +304,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
         })
         .await?;
+    // Let an in-flight save finish pushing before the process exits.
+    repo.settled().await;
     Ok(())
 }

@@ -18,11 +18,20 @@ export type PageSummary = {
 export type RawFile = { path: string; blob: string; size: number }
 export type Template = { name: string; text: string }
 
+export type SaveState = {
+  id: number
+  paths: string[]
+  state: 'pushing' | 'pushed' | 'failed'
+  subject: string
+  error: string | null
+}
+
 export type SyncStatus = {
   head: string
   branch: string
   lastSync: number | null
   lastError: string | null
+  saves: SaveState[]
 }
 
 export type Wiki = {
@@ -89,6 +98,8 @@ export type Committed = {
   head: string
   commit: string | null
   warnings: string[]
+  save: number | null
+  blobs: Record<string, string>
 }
 
 export type ConflictDetails = {

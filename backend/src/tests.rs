@@ -4,7 +4,7 @@
 use crate::{
     AppState, app, auth,
     git::Git,
-    repo::{CommitError, Op, Repo},
+    repo::{CommitError, Message, Op, Repo},
 };
 use axum::{
     body::Body,
@@ -156,6 +156,7 @@ impl Fixture {
             "main".into(),
             scratch,
             "node".into(),
+            None,
         ));
         repo.open().await.unwrap();
         Fixture {
@@ -191,8 +192,13 @@ impl Fixture {
     ) -> Result<crate::repo::Committed, CommitError> {
         let path = format!("wiki/{key}.md");
         let (text, base) = (text.to_string(), base.to_string());
-        self.repo
-            .commit("docs(test): edit\n", move |_| {
+        let message = Message {
+            subject: "docs(test): edit".into(),
+            generate: false,
+        };
+        let result = self
+            .repo
+            .commit(message, move |_| {
                 Ok((
                     vec![Op::Write {
                         path: path.clone(),
@@ -201,7 +207,10 @@ impl Fixture {
                     vec![(path, Some(base))],
                 ))
             })
-            .await
+            .await;
+        // Saves push in the background; wait for that before inspecting.
+        self.repo.settled().await;
+        result
     }
 }
 
@@ -243,6 +252,40 @@ async fn pulls_agent_commits_before_writing() {
         f.remote_file("wiki/entities/alpha.md")
             .contains("Owner edit")
     );
+}
+
+#[tokio::test]
+async fn reports_a_failed_push_and_keeps_the_clone_clean() {
+    let f = Fixture::new().await;
+    let hook = f.repo.git.dir.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\necho 'remote: offline' >&2\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let start = sh(&f.remote, &["rev-parse", "main"]);
+    let base = f.blob("entities/alpha");
+    let done = f
+        .save(
+            "entities/alpha",
+            &page("Alpha", "Lost? [[entities/beta]]"),
+            &base,
+        )
+        .await
+        .unwrap();
+    let save = f
+        .repo
+        .status()
+        .saves
+        .into_iter()
+        .find(|s| Some(s.id) == done.save)
+        .unwrap();
+    assert_eq!(save.state, "failed");
+    assert!(save.error.is_some());
+    // The local commit was reset away; the clone mirrors the remote again.
+    assert_eq!(f.repo.git.rev("HEAD").await.unwrap(), start.trim());
+    assert_eq!(f.blob("entities/alpha"), base);
 }
 
 #[tokio::test]
@@ -501,6 +544,7 @@ async fn api_requires_sign_in_and_handles_page_lifecycle() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    f.repo.settled().await;
     assert!(
         f.remote_file("wiki/index.md")
             .contains("- [[entities/beta]] — Beta.\n- [[entities/gamma]] — Gamma.\n")
@@ -512,6 +556,7 @@ async fn api_requires_sign_in_and_handles_page_lifecycle() {
         "from": "entities/alpha", "to": "concepts/alpha", "baseBlob": base, "message": "docs(alpha): move to concepts"
     }))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    f.repo.settled().await;
     assert!(
         f.remote_file("wiki/entities/beta.md")
             .contains("[[concepts/alpha|the first]]")
