@@ -1,0 +1,110 @@
+name: Validate and publish
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    concurrency:
+      group: llm-wiki-web-build-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix develop --command npm ci
+      - run: nix develop --command npm run typecheck
+      - run: nix develop --command npm run format:check
+      - run: nix develop --command cargo fmt --manifest-path backend/Cargo.toml -- --check
+      - run: nix develop --command cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
+      - run: nix develop --command cargo test --manifest-path backend/Cargo.toml
+      - run: nix develop --command npm run build
+      - run: nix build .#container
+      - name: Smoke-test the image against a scratch wiki
+        run: |
+          docker load < result
+          git init -q --bare -b main "$RUNNER_TEMP/wiki.git"
+          git clone -q "$RUNNER_TEMP/wiki.git" "$RUNNER_TEMP/seed"
+          cd "$RUNNER_TEMP/seed"
+          mkdir -p wiki tools
+          printf -- '---\ntype: overview\nstatus: active\nupdated: 2026-10-14\n---\n\n# Index\n\n## Pages\n\n- [[a]] — A.\n' > wiki/index.md
+          printf -- '---\ntype: entity\nstatus: active\nupdated: 2026-10-14\n---\n\n# A\n\nSee [[index]].\n' > wiki/a.md
+          printf "console.log('Checked 2 pages: 0 error(s), 0 warning(s)')\n" > tools/wiki_check.js
+          git add -A && git -c user.name=ci -c user.email=ci@example.org commit -qm init && git push -q origin main
+          chmod -R a+rwX "$RUNNER_TEMP/wiki.git"
+          docker run -d --name smoke --read-only --tmpfs /tmp --tmpfs /data:uid=10001,gid=10001 \
+            -v "$RUNNER_TEMP/wiki.git:/wiki.git" -e LLM_WIKI_REPO_URL=/wiki.git \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            -p 127.0.0.1:8080:8080 ghcr.io/fruitiex/llm-wiki-web:main
+          for i in $(seq 30); do curl -sf localhost:8080/api/ready && break; sleep 1; done
+          curl -sf localhost:8080/api/ready
+          curl -sf localhost:8080/ | grep -q '<title>llm-wiki</title>'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/wiki)" = 401
+          docker logs smoke
+      - name: Publish image
+        id: publish
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag ghcr.io/fruitiex/llm-wiki-web:main ghcr.io/fruitiex/llm-wiki-web:${{ github.sha }}
+          docker push ghcr.io/fruitiex/llm-wiki-web:main
+          docker push ghcr.io/fruitiex/llm-wiki-web:${{ github.sha }}
+          reference="$(docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/fruitiex/llm-wiki-web:${{ github.sha }})"
+          [[ "$reference" == ghcr.io/fruitiex/llm-wiki-web@sha256:* ]]
+          digest="${reference##*@}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      HOMELAB_DISPATCH_TOKEN: ${{ secrets.HOMELAB_DISPATCH_TOKEN }}
+    steps:
+      - name: Check deployment configuration and source revision
+        id: deployment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ -z "$HOMELAB_DISPATCH_TOKEN" ]]; then
+            echo '::warning::Auto deployment is disabled until HOMELAB_DISPATCH_TOKEN is added to this repository.'
+            printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo 'A newer main commit exists; skipping deployment of this older build.'
+            printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Deploy tested image to homelab
+        if: steps.deployment.outputs.enabled == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.HOMELAB_DISPATCH_TOKEN }}
+          repository: FruitieX/homelab
+          event-type: image-update
+          client-payload: |
+            {
+              "image": "ghcr.io/fruitiex/llm-wiki-web",
+              "digest": "${{ needs.build.outputs.digest }}",
+              "revision": "${{ github.sha }}"
+            }

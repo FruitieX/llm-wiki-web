@@ -1,0 +1,8 @@
+node_modules/
+dist/
+target/
+data/
+test-results/
+result
+result-*
+.env
