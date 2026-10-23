@@ -1,12 +1,14 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { api, ApiError, setUnauthorizedHandler } from '../lib/api'
+import { KeyRound } from 'lucide-react'
 import { Mark } from './Mark'
 
 type AuthStatus = {
   configured: boolean
   signedIn: boolean
   setupAvailable: boolean
+  oidc?: boolean
 }
 
 export function useAuthStatus() {
@@ -63,7 +65,71 @@ function Frame({ children }: { children: ReactNode }) {
   )
 }
 
+/** The callback sends failed passkey sign-ins back here with `?signin=failed`. */
+function takeSignInFailure() {
+  const url = new URL(window.location.href)
+  if (url.searchParams.get('signin') !== 'failed') return false
+  url.searchParams.delete('signin')
+  window.history.replaceState(null, '', url.pathname + url.search + url.hash)
+  return true
+}
+
 function SignIn({ status }: { status: AuthStatus }) {
+  const [failed] = useState(takeSignInFailure)
+  const [usePassword, setUsePassword] = useState(false)
+  const fallback = status.configured || status.setupAvailable
+  if (!status.oidc || usePassword)
+    return (
+      <PasswordSignIn
+        status={status}
+        onPasskey={status.oidc ? () => setUsePassword(false) : undefined}
+      />
+    )
+  const next = window.location.pathname + window.location.search
+  return (
+    <Frame>
+      <div className="space-y-4 rounded-2xl border border-line bg-elev p-5 shadow-soft">
+        {failed && (
+          <p
+            className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger"
+            role="alert"
+          >
+            Passkey sign-in didn't work. Try again, or check that your account
+            may use the wiki.
+          </p>
+        )}
+        <a
+          className="btn primary h-11 w-full"
+          href={`/auth/login?next=${encodeURIComponent(next)}`}
+          data-oidc-login
+        >
+          <KeyRound size={16} />
+          Sign in with passkey
+        </a>
+        <p className="text-center text-xs text-ink-3">Through Pocket ID.</p>
+      </div>
+      {fallback && (
+        <button
+          type="button"
+          className="mx-auto mt-5 block text-sm text-ink-3 underline-offset-4 hover:text-ink-2 hover:underline"
+          onClick={() => setUsePassword(true)}
+        >
+          {status.configured
+            ? 'Use the owner password instead'
+            : 'Set an owner password instead'}
+        </button>
+      )}
+    </Frame>
+  )
+}
+
+function PasswordSignIn({
+  status,
+  onPasskey,
+}: {
+  status: AuthStatus
+  onPasskey?: () => void
+}) {
   const client = useQueryClient()
   const setup = !status.configured
   const [token, setToken] = useState('')
@@ -161,6 +227,15 @@ function SignIn({ status }: { status: AuthStatus }) {
           {busy ? 'One moment…' : setup ? 'Set password' : 'Sign in'}
         </button>
       </form>
+      {onPasskey && (
+        <button
+          type="button"
+          className="mx-auto mt-5 block text-sm text-ink-3 underline-offset-4 hover:text-ink-2 hover:underline"
+          onClick={onPasskey}
+        >
+          Sign in with a passkey instead
+        </button>
+      )}
     </Frame>
   )
 }

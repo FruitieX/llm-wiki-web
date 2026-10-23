@@ -7,7 +7,10 @@ export default defineConfig({
   server: {
     port: Number(process.env.LLM_WIKI_DEV_PORT ?? 3102),
     strictPort: true,
-    proxy: { '/api': process.env.LLM_WIKI_API_URL ?? 'http://127.0.0.1:3002' },
+    proxy: {
+      '/api': process.env.LLM_WIKI_API_URL ?? 'http://127.0.0.1:3002',
+      '/auth': process.env.LLM_WIKI_API_URL ?? 'http://127.0.0.1:3002',
+    },
   },
   build: { chunkSizeWarningLimit: 900 },
 })

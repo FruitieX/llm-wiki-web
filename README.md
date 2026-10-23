@@ -32,6 +32,19 @@ editor. It has no database: **storage is git**.
 - **Sign-in.** One owner password (argon2) set on first visit with `LLM_WIKI_SETUP_TOKEN`; 90-day HttpOnly session
   cookies; `auth.json` on the data volume. Writes need the `x-llm-wiki: 1` header and, when set, a matching
   `LLM_WIKI_ORIGIN`.
+- **Passkey sign-in** (optional) through Pocket ID: OIDC authorization code flow with PKCE at `/auth/login` →
+  `/auth/callback` (`backend/src/oidc.rs`). Any member of an allowed group is the owner. It then issues the app's own
+  session, which lasts 365 days and slides (renewed at most daily on use). When configured, the sign-in screen leads
+  with "Sign in with passkey"; the password stays as a fallback. Pending sign-ins live in memory for 10 minutes, so a
+  restart mid-sign-in only means tapping the button again. Configure with all of:
+
+  | Variable | Meaning |
+  | --- | --- |
+  | `LLM_WIKI_OIDC_ISSUER` | e.g. `https://id.fruitiex.org` |
+  | `LLM_WIKI_OIDC_CLIENT_ID` | e.g. `llm-wiki-web` |
+  | `LLM_WIKI_OIDC_CLIENT_SECRET` | the client secret |
+  | `LLM_WIKI_OIDC_ALLOWED_GROUPS` | comma-separated; empty allows anyone the provider admits |
+  | `LLM_WIKI_OIDC_REDIRECT_URL` | optional; defaults to `$LLM_WIKI_ORIGIN/auth/callback` |
 
 ## Development
 
@@ -48,7 +61,8 @@ LLM_WIKI_REPO_URL=/tmp/wiki.git LLM_WIKI_DATA_DIR=/tmp/llm-wiki-data \
 Checks: `npm run typecheck`, `npm run format:check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (real
 git repos: concurrent edits, push rejection and retry, rewritten remotes, validation, rename, auth). `npm run test:ui`
 drives the built app in Chromium (see the header of `scripts/verify-ui.mjs`), including an agent commit landing
-mid-edit, and writes screenshots to `test-results/`.
+mid-edit, and writes screenshots to `test-results/`. With `LLM_WIKI_MOCK_OIDC_PORT` it serves a mock OpenID provider
+and signs in with the passkey flow instead.
 
 ## Deployment
 

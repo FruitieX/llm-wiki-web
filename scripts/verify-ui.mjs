@@ -6,8 +6,15 @@
 //
 // The agent clone must point at the same remote as the server (a scratch
 // mirror, never the real wiki). Screenshots land in test-results/.
+//
+// Passkey sign-in: set LLM_WIKI_MOCK_OIDC_PORT=3190 here and start the server
+// with LLM_WIKI_OIDC_ISSUER=http://127.0.0.1:3190, LLM_WIKI_OIDC_CLIENT_ID=llm-wiki-web,
+// LLM_WIKI_OIDC_CLIENT_SECRET=mock-secret and LLM_WIKI_OIDC_ALLOWED_GROUPS=admins.
+// The script then serves a mock provider and signs in through it.
 import { chromium } from 'playwright'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createServer } from 'node:http'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -30,14 +37,112 @@ const check = (ok, what) => {
 const git = (...args) =>
   execFileSync('git', ['-C', agent, ...args], { encoding: 'utf8' })
 
+const oidcPort = process.env.LLM_WIKI_MOCK_OIDC_PORT
+let provider
+if (oidcPort) {
+  // Discovery, an authorize endpoint that approves at once (the "code" carries
+  // the nonce and PKCE challenge), and a token endpoint that checks them.
+  const issuer = `http://127.0.0.1:${oidcPort}`
+  const b64 = (value) => Buffer.from(value).toString('base64url')
+  provider = createServer(async (req, res) => {
+    const url = new URL(req.url, issuer)
+    const json = (status, body) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+    }
+    if (url.pathname === '/.well-known/openid-configuration')
+      return json(200, {
+        issuer,
+        authorization_endpoint: `${issuer}/authorize`,
+        token_endpoint: `${issuer}/token`,
+      })
+    if (url.pathname === '/authorize') {
+      const p = url.searchParams
+      const code = b64(
+        JSON.stringify({
+          nonce: p.get('nonce'),
+          challenge: p.get('code_challenge'),
+        }),
+      )
+      res.writeHead(302, {
+        location: `${p.get('redirect_uri')}?code=${code}&state=${p.get('state')}`,
+      })
+      return res.end()
+    }
+    if (url.pathname === '/token') {
+      let body = ''
+      for await (const chunk of req) body += chunk
+      const form = new URLSearchParams(body)
+      const code = JSON.parse(Buffer.from(form.get('code'), 'base64url'))
+      const challenge = createHash('sha256')
+        .update(form.get('code_verifier'))
+        .digest('base64url')
+      if (
+        form.get('client_secret') !== 'mock-secret' ||
+        code.challenge !== challenge
+      )
+        return json(400, { error: 'invalid_grant' })
+      const claims = {
+        iss: issuer,
+        sub: 'owner',
+        aud: form.get('client_id'),
+        exp: Math.floor(Date.now() / 1000) + 60,
+        nonce: code.nonce,
+        name: 'Owner',
+        groups: ['admins'],
+      }
+      return json(200, {
+        id_token: `e30.${b64(JSON.stringify(claims))}.sig`,
+        token_type: 'Bearer',
+      })
+    }
+    json(404, {})
+  }).listen(Number(oidcPort), '127.0.0.1')
+}
+
 async function signIn(page) {
   await page.goto(base)
+  if (oidcPort) {
+    await page.waitForSelector('[data-oidc-login]')
+    await page.screenshot({ path: join(out, 'desktop-signin.png') })
+    await page.emulateMedia({ colorScheme: 'dark' })
+    await page.reload()
+    await page.waitForSelector('[data-oidc-login]')
+    await page.screenshot({ path: join(out, 'desktop-signin-dark.png') })
+    await page.emulateMedia({ colorScheme: 'light' })
+    await page.reload()
+    // The password stays available as a fallback.
+    await page.click('text=/password instead/')
+    await page.waitForSelector('#password')
+    await page.screenshot({ path: join(out, 'desktop-signin-password.png') })
+    await page.click('text=/passkey instead/')
+    await page.click('[data-oidc-login]')
+    await page.waitForSelector('text=Operational memory')
+    return
+  }
   await page.waitForSelector('#password')
   if (await page.locator('#token').count()) await page.fill('#token', token)
   await page.fill('#password', password)
   await page.click('button[type=submit], form button.primary')
   await page.waitForSelector('text=Operational memory')
 }
+
+if (oidcPort)
+  for (const colorScheme of ['light', 'dark']) {
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      deviceScaleFactor: 2,
+      isMobile: true,
+      colorScheme,
+    })
+    const signin = await context.newPage()
+    await signin.goto(base)
+    await signin.waitForSelector('[data-oidc-login]')
+    await signin.screenshot({
+      path: join(out, `phone-signin-${colorScheme}.png`),
+    })
+    await context.close()
+  }
 
 const desktop = await browser.newContext({
   viewport: { width: 1440, height: 920 },
@@ -316,6 +421,7 @@ check(
   `no console errors${errors.length ? `: ${errors.join(' | ')}` : ''}`,
 )
 await browser.close()
+provider?.close()
 if (failures.length) {
   console.error(`${failures.length} check(s) failed`)
   process.exit(1)

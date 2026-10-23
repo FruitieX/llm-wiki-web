@@ -26,6 +26,7 @@ import { FOLDERS, folderOf, relativeTime } from '../lib/wiki'
 import { Mark } from './Mark'
 import { SearchDialog } from './Search'
 import { SaveToasts } from './SaveToasts'
+import { useAuthStatus } from './Auth'
 import { PasswordDialog } from './Password'
 import { Loading } from './States'
 
@@ -435,6 +436,8 @@ function MoreMenu() {
   const client = useQueryClient()
   const navigate = useNavigate()
   const [passwordOpen, setPasswordOpen] = useState(false)
+  // Passkey-only owners have no password to change.
+  const hasPassword = useAuthStatus().data?.configured !== false
   async function signOut() {
     await api('/api/auth/logout', { method: 'POST' }).catch(() => {})
     client.clear()
@@ -463,13 +466,15 @@ function MoreMenu() {
               <ThemeIcon size={16} />
               Theme: {theme === 'system' ? 'match system' : theme}
             </Menu.Item>
-            <Menu.Item
-              className="menu-item"
-              onSelect={() => setPasswordOpen(true)}
-            >
-              <KeyRound size={16} />
-              Change password
-            </Menu.Item>
+            {hasPassword && (
+              <Menu.Item
+                className="menu-item"
+                onSelect={() => setPasswordOpen(true)}
+              >
+                <KeyRound size={16} />
+                Change password
+              </Menu.Item>
+            )}
             <Menu.Separator className="my-1 h-px bg-line" />
             <Menu.Item className="menu-item" onSelect={signOut}>
               <LogOut size={16} />

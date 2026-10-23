@@ -10,7 +10,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header::SET_COOKIE},
+    http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,10 @@ use std::path::PathBuf;
 
 pub const COOKIE: &str = "llm_wiki_session";
 const SESSION_DAYS: i64 = 90;
+/// Sessions from a passkey (OIDC) sign-in last a year and slide: each use
+/// after a day pushes the expiry a year out again, so prompts stay rare.
+const OIDC_SESSION_DAYS: i64 = 365;
+const RENEW_AFTER_SECONDS: i64 = 86400;
 const MAX_SESSIONS: usize = 20;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -32,6 +36,9 @@ pub struct Session {
     pub digest: String,
     pub created: i64,
     pub expires: i64,
+    /// Renewed on use (passkey sign-ins); password sessions keep a fixed expiry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sliding: bool,
 }
 
 pub struct Auth {
@@ -93,6 +100,43 @@ impl Auth {
         Ok(())
     }
 
+    pub fn secure_cookie(&self) -> bool {
+        self.secure_cookie
+    }
+
+    fn cookie(&self, raw: &str, max_age: i64) -> Result<HeaderValue> {
+        format!(
+            "{COOKIE}={raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+            if self.secure_cookie { "; Secure" } else { "" }
+        )
+        .parse()
+        .map_err(ApiError::internal)
+    }
+
+    /// Checks the session and, for a sliding one last renewed over a day ago,
+    /// extends it. `None`: not signed in; `Some(Some(cookie))`: send the
+    /// renewed cookie with the response.
+    pub async fn check_and_renew(&self, headers: &HeaderMap) -> Option<Option<HeaderValue>> {
+        let raw = session_cookie(headers).filter(|raw| raw.len() == 64)?;
+        let digest = digest(raw);
+        let now = chrono::Utc::now().timestamp();
+        let mut file = self.file.lock().await;
+        let session = file
+            .sessions
+            .iter_mut()
+            .find(|session| session.digest == digest && session.expires > now)?;
+        let lifetime = OIDC_SESSION_DAYS * 86400;
+        if !session.sliding || session.expires - now > lifetime - RENEW_AFTER_SECONDS {
+            return Some(None);
+        }
+        session.expires = now + lifetime;
+        if let Err(error) = self.save(&file).await {
+            tracing::warn!("Could not renew a session: {}", error.message);
+            return Some(None);
+        }
+        Some(self.cookie(raw, lifetime).ok())
+    }
+
     pub async fn signed_in(&self, headers: &HeaderMap) -> bool {
         let Some(raw) = session_cookie(headers) else {
             return false;
@@ -130,27 +174,39 @@ impl Auth {
     }
 
     async fn start_session(&self, file: &mut AuthFile) -> Result<HeaderMap> {
+        let cookie = self.new_session(file, false).await?;
+        let mut headers = HeaderMap::new();
+        headers.insert(SET_COOKIE, cookie);
+        Ok(headers)
+    }
+
+    /// A year-long sliding session after a passkey sign-in; returns its cookie.
+    pub async fn start_oidc_session(&self) -> Result<HeaderValue> {
+        let mut file = self.file.lock().await;
+        self.new_session(&mut file, true).await
+    }
+
+    async fn new_session(&self, file: &mut AuthFile, sliding: bool) -> Result<HeaderValue> {
         let raw = token();
         let now = chrono::Utc::now().timestamp();
+        let lifetime = if sliding {
+            OIDC_SESSION_DAYS
+        } else {
+            SESSION_DAYS
+        } * 86400;
         file.sessions.retain(|session| session.expires > now);
         file.sessions.push(Session {
             digest: digest(&raw),
             created: now,
-            expires: now + SESSION_DAYS * 86400,
+            expires: now + lifetime,
+            sliding,
         });
         if file.sessions.len() > MAX_SESSIONS {
             let excess = file.sessions.len() - MAX_SESSIONS;
             file.sessions.drain(..excess);
         }
         self.save(file).await?;
-        let cookie = format!(
-            "{COOKIE}={raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
-            SESSION_DAYS * 86400,
-            if self.secure_cookie { "; Secure" } else { "" }
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(SET_COOKIE, cookie.parse().map_err(ApiError::internal)?);
-        Ok(headers)
+        self.cookie(&raw, lifetime)
     }
 }
 
@@ -191,6 +247,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<V
         "configured": configured,
         "signedIn": state.auth.signed_in(&headers).await,
         "setupAvailable": !configured && state.auth.setup_token.is_some(),
+        "oidc": state.oidc.is_some(),
     }))
 }
 

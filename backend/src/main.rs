@@ -4,6 +4,7 @@ mod auth;
 mod check;
 mod error;
 mod git;
+mod oidc;
 mod repo;
 #[cfg(test)]
 mod tests;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub repo: Arc<repo::Repo>,
     pub auth: Arc<auth::Auth>,
     pub origin: Option<String>,
+    /// Passkey sign-in through Pocket ID, when configured.
+    pub oidc: Option<Arc<oidc::Oidc>>,
 }
 
 pub fn app(state: AppState, static_dir: Option<&str>) -> Router {
@@ -40,6 +43,8 @@ pub fn app(state: AppState, static_dir: Option<&str>) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/password", post(auth::change_password))
+        .route("/auth/login", get(oidc::login))
+        .route("/auth/callback", get(oidc::callback))
         .route("/api/wiki", get(api::wiki))
         .route("/api/page", get(api::page).put(api::save).post(api::create))
         .route("/api/page/move", post(api::rename))
@@ -150,11 +155,18 @@ async fn protect(State(state): State<AppState>, request: Request, next: Next) ->
             ));
         }
     }
-    if api && !PUBLIC.contains(&path) && !state.auth.signed_in(request.headers()).await {
-        return Err(ApiError::unauthorized());
+    let mut renewed = None;
+    if api && !PUBLIC.contains(&path) {
+        match state.auth.check_and_renew(request.headers()).await {
+            Some(cookie) => renewed = cookie,
+            None => return Err(ApiError::unauthorized()),
+        }
     }
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    if let Some(cookie) = renewed {
+        headers.append("set-cookie", cookie);
+    }
     if api {
         headers.insert("cache-control", HeaderValue::from_static("no-store"));
     }
@@ -171,6 +183,43 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Optional: all of issuer, client id and secret, or none of them.
+fn oidc_config(
+    origin: Option<&str>,
+) -> std::result::Result<Option<oidc::OidcConfig>, Box<dyn std::error::Error>> {
+    let issuer = env("LLM_WIKI_OIDC_ISSUER");
+    let client_id = env("LLM_WIKI_OIDC_CLIENT_ID");
+    let client_secret = env("LLM_WIKI_OIDC_CLIENT_SECRET");
+    let (issuer, client_id, client_secret) = match (issuer, client_id, client_secret) {
+        (None, None, None) => return Ok(None),
+        (Some(issuer), Some(id), Some(secret)) => (issuer, id, secret),
+        _ => {
+            return Err("Set LLM_WIKI_OIDC_ISSUER, LLM_WIKI_OIDC_CLIENT_ID and \
+                        LLM_WIKI_OIDC_CLIENT_SECRET together"
+                .into());
+        }
+    };
+    let redirect_url = env("LLM_WIKI_OIDC_REDIRECT_URL")
+        .or_else(|| origin.map(|origin| format!("{origin}/auth/callback")))
+        .ok_or("Set LLM_WIKI_ORIGIN or LLM_WIKI_OIDC_REDIRECT_URL for passkey sign-in")?;
+    let allowed_groups = env("LLM_WIKI_OIDC_ALLOWED_GROUPS")
+        .map(|groups| {
+            groups
+                .split(',')
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(oidc::OidcConfig {
+        issuer: issuer.trim_end_matches('/').to_string(),
+        client_id,
+        client_secret,
+        redirect_url,
+        allowed_groups,
+    }))
 }
 
 #[tokio::main]
@@ -258,10 +307,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         setup_token,
         secure_cookie,
     )?);
+    let oidc = oidc_config(origin.as_deref())?.map(|config| {
+        tracing::info!(
+            "Passkey sign-in through {} as {}",
+            config.issuer,
+            config.client_id
+        );
+        Arc::new(oidc::Oidc::new(config))
+    });
     let state = AppState {
         repo: repo.clone(),
         auth,
         origin,
+        oidc,
     };
 
     // Clone (or catch up) before serving; retry while GitHub is unreachable.

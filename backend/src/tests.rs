@@ -481,6 +481,7 @@ async fn api_requires_sign_in_and_handles_page_lifecycle() {
             auth::Auth::load(auth_file, Some("setup-token-0123456789".into()), false).unwrap(),
         ),
         origin: Some("https://wiki.example.org".into()),
+        oidc: None,
     };
     let router = app(state, None);
     let (status, _, _) = call(&router, "GET", "/api/wiki", None, None).await;
@@ -636,4 +637,238 @@ async fn api_requires_sign_in_and_handles_page_lifecycle() {
     )
     .await;
     assert_eq!(body["hits"][0]["key"], "entities/beta");
+}
+
+/// A minimal OpenID provider: discovery and a token endpoint. The "code" is
+/// the user, nonce and PKCE challenge, which the token endpoint checks.
+async fn mock_provider() -> String {
+    use axum::{Form, routing::post};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let issuer = base.clone();
+    let router = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get({
+                let base = base.clone();
+                move || async move {
+                    axum::Json(json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(move |Form(form): Form<HashMap<String, String>>| {
+                let issuer = issuer.clone();
+                async move {
+                    let code: Value =
+                        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&form["code"]).unwrap())
+                            .unwrap();
+                    let challenge =
+                        URL_SAFE_NO_PAD.encode(Sha256::digest(form["code_verifier"].as_bytes()));
+                    if form["client_secret"] != "idp-secret"
+                        || form["client_id"] != "llm-wiki-web"
+                        || code["challenge"] != challenge
+                    {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let groups = if code["user"] == "rasse" {
+                        json!(["admins", "family"])
+                    } else {
+                        json!(["family"])
+                    };
+                    let claims = json!({
+                        "iss": issuer, "sub": format!("sub-{}", code["user"].as_str().unwrap()),
+                        "aud": "llm-wiki-web", "exp": chrono::Utc::now().timestamp() + 60,
+                        "nonce": code["nonce"], "preferred_username": code["user"], "groups": groups,
+                    });
+                    let token = format!(
+                        "e30.{}.sig",
+                        URL_SAFE_NO_PAD.encode(claims.to_string())
+                    );
+                    Ok(axum::Json(json!({ "id_token": token, "token_type": "Bearer" })))
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    base
+}
+
+async fn get_raw(
+    router: &axum::Router,
+    uri: &str,
+    cookie: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder().uri(uri);
+    if let Some(cookie) = cookie {
+        request = request.header("cookie", cookie);
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn cookies(response: &axum::response::Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+fn location(response: &axum::response::Response) -> String {
+    response.headers()["location"].to_str().unwrap().to_string()
+}
+
+fn query_param(url: &str, name: &str) -> String {
+    url.split_once('?')
+        .unwrap()
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+        .unwrap()
+        .to_string()
+}
+
+/// Signs in through `/auth/login` and the callback as `user`; returns the
+/// callback's response.
+async fn passkey_sign_in(router: &axum::Router, user: &str) -> axum::response::Response {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let start = get_raw(router, "/auth/login?next=%2Fpage%2Fentities%2Fbeta", None).await;
+    assert_eq!(start.status(), StatusCode::SEE_OTHER);
+    let authorize = location(&start);
+    let state = query_param(&authorize, "state");
+    assert!(
+        cookies(&start)[0].starts_with(&format!("llm_wiki_oidc={state}; Path=/auth; HttpOnly"))
+    );
+    let code = URL_SAFE_NO_PAD.encode(
+        json!({
+            "user": user,
+            "nonce": query_param(&authorize, "nonce"),
+            "challenge": query_param(&authorize, "code_challenge"),
+        })
+        .to_string(),
+    );
+    get_raw(
+        router,
+        &format!("/auth/callback?code={code}&state={state}"),
+        Some(&format!("llm_wiki_oidc={state}")),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn passkey_sign_in_through_the_provider() {
+    let f = Fixture::new().await;
+    let issuer = mock_provider().await;
+    let state = AppState {
+        repo: f.repo.clone(),
+        auth: Arc::new(auth::Auth::load(f.repo.scratch.join("auth.json"), None, true).unwrap()),
+        origin: Some("https://wiki.example.org".into()),
+        oidc: Some(Arc::new(crate::oidc::Oidc::new(crate::oidc::OidcConfig {
+            issuer,
+            client_id: "llm-wiki-web".into(),
+            client_secret: "idp-secret".into(),
+            redirect_url: "https://wiki.example.org/auth/callback".into(),
+            allowed_groups: vec!["admins".into()],
+        }))),
+    };
+    let router = app(state, None);
+    let (_, body, _) = call(&router, "GET", "/api/auth/status", None, None).await;
+    assert_eq!(body["oidc"], true);
+
+    // An admin signs in and lands on the page they started from.
+    let done = passkey_sign_in(&router, "rasse").await;
+    assert_eq!(done.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&done), "/page/entities/beta");
+    let set = cookies(&done);
+    let session = set
+        .iter()
+        .find(|c| c.starts_with("llm_wiki_session="))
+        .unwrap();
+    assert!(session.contains("Max-Age=31536000") && session.contains("; Secure"));
+    assert!(set.iter().any(|c| c.starts_with("llm_wiki_oidc=;")));
+    let cookie = session.split(';').next().unwrap().to_string();
+    let (status, _, renewed) = call(&router, "GET", "/api/wiki", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(renewed.is_none(), "a fresh session is not renewed yet");
+    // Writes still need the same-origin header.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sync")
+        .header("cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, _) = call(&router, "POST", "/api/sync", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Someone outside the allowed groups is refused.
+    let refused = passkey_sign_in(&router, "julle").await;
+    assert_eq!(location(&refused), "/?signin=failed");
+    assert!(
+        !cookies(&refused)
+            .iter()
+            .any(|c| c.starts_with("llm_wiki_session="))
+    );
+
+    // A callback without this browser's state cookie is refused.
+    let start = get_raw(&router, "/auth/login", None).await;
+    let state = query_param(&location(&start), "state");
+    let forged = get_raw(
+        &router,
+        &format!("/auth/callback?code=x&state={state}"),
+        Some("llm_wiki_oidc=someone-elses"),
+    )
+    .await;
+    assert_eq!(location(&forged), "/?signin=failed");
+}
+
+#[tokio::test]
+async fn passkey_sessions_slide_and_password_sessions_do_not() {
+    let f = Fixture::new().await;
+    let path = f.repo.scratch.join("auth.json");
+    let day = 86400;
+    let now = chrono::Utc::now().timestamp();
+    let raw = |c: char| c.to_string().repeat(64);
+    let file = json!({
+        "password_hash": null,
+        "sessions": [
+            // A passkey session last renewed two days ago, and a password one.
+            { "digest": auth::digest(&raw('a')), "created": now - 2 * day, "expires": now + 363 * day, "sliding": true },
+            { "digest": auth::digest(&raw('b')), "created": now - 2 * day, "expires": now + 88 * day },
+        ],
+    });
+    std::fs::write(&path, file.to_string()).unwrap();
+    let auth = auth::Auth::load(path.clone(), None, false).unwrap();
+    let headers = |c: char| {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("llm_wiki_session={}", raw(c)).parse().unwrap(),
+        );
+        h
+    };
+    let renewed = auth.check_and_renew(&headers('a')).await.unwrap().unwrap();
+    assert!(renewed.to_str().unwrap().contains("Max-Age=31536000"));
+    assert_eq!(auth.check_and_renew(&headers('a')).await, Some(None));
+    assert_eq!(auth.check_and_renew(&headers('b')).await, Some(None));
+    assert_eq!(auth.check_and_renew(&headers('c')).await, None);
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(saved["sessions"][0]["expires"].as_i64().unwrap() >= now + 365 * day);
+    assert_eq!(saved["sessions"][1]["expires"], now + 88 * day);
+    assert!(saved["sessions"][1].get("sliding").is_none());
 }
