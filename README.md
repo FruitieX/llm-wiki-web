@@ -94,3 +94,7 @@ npm run build && npm run test:ui                 # drives the built app in Chrom
 
 `npm run test:ui` writes screenshots to `test-results/`. CI also smoke-tests
 the container against a throwaway wiki with `scripts/smoke-ui.mjs`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
