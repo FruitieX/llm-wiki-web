@@ -18,7 +18,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -46,12 +46,19 @@ jobs:
           docker run -d --name smoke --read-only --tmpfs /tmp --tmpfs /data:uid=10001,gid=10001 \
             -v "$RUNNER_TEMP/wiki.git:/wiki.git" -e LLM_WIKI_REPO_URL=/wiki.git \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            -e LLM_WIKI_SETUP_TOKEN=ci-setup-token-0123456789 \
             -p 127.0.0.1:8080:8080 ghcr.io/fruitiex/llm-wiki-web:main
           for i in $(seq 30); do curl -sf localhost:8080/api/ready && break; sleep 1; done
           curl -sf localhost:8080/api/ready
           curl -sf localhost:8080/ | grep -q '<title>llm-wiki</title>'
           test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/wiki)" = 401
-          docker logs smoke
+      - name: Smoke-test the UI in Chromium
+        run: |
+          LLM_WIKI_URL=http://127.0.0.1:8080 LLM_WIKI_SETUP_TOKEN=ci-setup-token-0123456789 \
+            nix develop --command node scripts/smoke-ui.mjs
+      - name: Container logs
+        if: always()
+        run: docker logs smoke || true
       - name: Publish image
         id: publish
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
