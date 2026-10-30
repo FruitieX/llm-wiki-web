@@ -6,13 +6,12 @@ use crate::{
     AppState,
     error::{ApiError, Result},
 };
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use axum::{
     Json,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
 };
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,11 +50,15 @@ pub struct Auth {
 
 pub fn token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    rand::fill(&mut bytes);
+    hex(&bytes)
 }
+/// Stored session digests are lowercase hex, so this must keep producing exactly that.
 pub fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex(&Sha256::digest(value.as_bytes()))
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -218,7 +221,7 @@ async fn hash_password(password: String) -> Result<String> {
     }
     tokio::task::spawn_blocking(move || {
         Argon2::default()
-            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+            .hash_password(password.as_bytes())
             .map(|hash| hash.to_string())
             .map_err(ApiError::internal)
     })
@@ -231,11 +234,10 @@ async fn verify_password(password: String, hash: String) -> Result<bool> {
         return Ok(false);
     }
     tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&hash).is_ok_and(|hash| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &hash)
-                .is_ok()
-        })
+        // Parses the stored PHC string; a malformed one fails like a wrong password.
+        Argon2::default()
+            .verify_password(password.as_bytes(), hash.as_str())
+            .is_ok()
     })
     .await
     .map_err(ApiError::internal)
@@ -366,4 +368,44 @@ pub async fn change_password(
     file.sessions.clear();
     let headers = auth.start_session(&mut file).await?;
     Ok((headers, Json(json!({ "ok": true }))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_is_lowercase_hex_sha256() {
+        assert_eq!(
+            digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(token().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn verifies_existing_and_new_password_hashes() {
+        // Made by the reference argon2 CLI with the parameters argon2 0.5 used, like the
+        // hash already stored in production.
+        let stored = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0MTZi$ruW22rZ+Z2oQpc09UDt/snC/wUlvZib0deQGUp52TIc";
+        let password = "correct horse battery staple".to_string();
+        assert!(
+            verify_password(password.clone(), stored.into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_password("wrong password!".into(), stored.into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_password(password.clone(), "not a hash".into())
+                .await
+                .unwrap()
+        );
+        let fresh = hash_password(password.clone()).await.unwrap();
+        assert!(fresh.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert!(verify_password(password, fresh).await.unwrap());
+    }
 }
