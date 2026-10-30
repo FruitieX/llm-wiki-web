@@ -13,7 +13,9 @@
       frontend = pkgs.buildNpmPackage {
         pname = "llm-wiki-web-ui"; version = "0.1.0"; src = source;
         nodejs = pkgs.nodejs_26;
-        npmDepsHash = "sha256-20uz0BStWJmAZfqsZpQ0mzVwlvF/YKTLBnOEL013gbc=";
+        # Read from package-lock.json, so dependency updates need no hash bump.
+        npmDeps = pkgs.importNpmLock { npmRoot = ./.; };
+        npmConfigHook = pkgs.importNpmLock.npmConfigHook;
         installPhase = ''mkdir -p $out/share/llm-wiki-web; cp -r dist/. $out/share/llm-wiki-web/'';
       };
       backend = pkgs.rustPlatform.buildRustPackage {
